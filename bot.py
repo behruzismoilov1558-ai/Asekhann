@@ -2,7 +2,9 @@ import os
 import random
 import sqlite3
 import logging
+import threading
 from datetime import date
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
 from google import genai
@@ -18,12 +20,13 @@ load_dotenv()
 TG_TOKEN = os.environ.get("TG_TOKEN") or os.environ["BOT_TOKEN"]
 ASILA_ID = int(os.getenv("ASILA_ID", "0") or 0)   # ixtiyoriy: 0 = Behruz funksiyasi o'chiq
 BOT_NAME = os.getenv("BOT_NAME", "Do'stcha")
-MODEL = os.getenv("MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("MODEL", "gemini-3.8-flash")
 DB_PATH = os.getenv("DB_PATH", "data.db")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "150"))  # har bir odamga kuniga xabar limiti
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # tokenni logda yashirish
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 private_only = filters.ChatType.PRIVATE
@@ -132,8 +135,7 @@ async def ask_ai(system, msgs, max_tokens=600):
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system,
-            max_output_tokens=max_tokens,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
+            max_output_tokens=max_tokens * 3,  # modelning ichki "o'ylashi" ham shu limitdan hisoblanadi
         ),
     )
     return (resp.text or "").strip()
@@ -230,7 +232,26 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.exception("Xotirani yangilashda xato")
 
 
+# ---------- Render uchun ping serveri (port ochish + UptimeRobot uchun) ----------
+class Ping(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    do_HEAD = do_GET
+
+    def log_message(self, *args):
+        pass
+
+
+def run_ping_server():
+    port = int(os.getenv("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), Ping).serve_forever()
+
+
 def main():
+    threading.Thread(target=run_ping_server, daemon=True).start()
     app = ApplicationBuilder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", start, filters=private_only))
     app.add_handler(CommandHandler("id", my_id, filters=private_only))
