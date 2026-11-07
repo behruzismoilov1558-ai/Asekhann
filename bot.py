@@ -1,4 +1,5 @@
 import os
+import asyncio
 import random
 import sqlite3
 import logging
@@ -21,6 +22,7 @@ TG_TOKEN = os.environ.get("TG_TOKEN") or os.environ["BOT_TOKEN"]
 ASILA_ID = int(os.getenv("ASILA_ID", "0") or 0)   # ixtiyoriy: 0 = Behruz funksiyasi o'chiq
 BOT_NAME = os.getenv("BOT_NAME", "Do'stcha")
 MODEL = os.getenv("MODEL", "gemini-3.8-flash")
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "gemini-3.6-flash")  # asosiy model band bo'lsa
 DB_PATH = os.getenv("DB_PATH", "data.db")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "150"))  # har bir odamga kuniga xabar limiti
 
@@ -86,7 +88,7 @@ def save(uid, role, text):
     db.commit()
 
 
-def history(uid, n=30):
+def history(uid, n=20):
     rows = db.execute(
         "SELECT role, content FROM msgs WHERE uid=? ORDER BY id DESC LIMIT ?", (uid, n)
     ).fetchall()
@@ -130,15 +132,27 @@ async def ask_ai(system, msgs, max_tokens=600):
                       parts=[types.Part(text=m["content"])])
         for m in msgs
     ]
-    resp = await client.aio.models.generate_content(
-        model=MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=max_tokens * 3,  # modelning ichki "o'ylashi" ham shu limitdan hisoblanadi
-        ),
-    )
-    return (resp.text or "").strip()
+    last_err = None
+    # 1-2 urinish: asosiy model, 3-urinish: zaxira model (503 "band" xatosi uchun)
+    for attempt, model in enumerate([MODEL, MODEL, FALLBACK_MODEL], start=1):
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    max_output_tokens=max_tokens * 3,  # modelning ichki "o'ylashi" ham shu limitdan hisoblanadi
+                ),
+            )
+            text = (resp.text or "").strip()
+            if text:
+                return text
+            last_err = ValueError("Bo'sh javob")
+        except Exception as e:
+            last_err = e
+            log.warning("Gemini xatosi (%s, %d-urinish): %s", model, attempt, str(e)[:150])
+        await asyncio.sleep(1 * attempt)
+    raise last_err
 
 
 # ---------- Uzoq xotira ----------
@@ -156,6 +170,16 @@ async def update_notes(uid):
         db.execute("INSERT INTO mem(uid, notes, counter) VALUES(?,?,0) "
                    "ON CONFLICT(uid) DO UPDATE SET notes=excluded.notes, counter=0", (uid, text))
         db.commit()
+
+
+bg_tasks = set()
+
+
+async def update_notes_safe(uid):
+    try:
+        await update_notes(uid)
+    except Exception:
+        log.exception("Xotirani yangilashda xato")
 
 
 # ---------- Handlerlar ----------
@@ -226,10 +250,9 @@ async def chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db.execute("UPDATE mem SET counter=counter+1 WHERE uid=?", (uid,))
     db.commit()
     if db.execute("SELECT counter FROM mem WHERE uid=?", (uid,)).fetchone()[0] >= 10:
-        try:
-            await update_notes(uid)
-        except Exception:
-            log.exception("Xotirani yangilashda xato")
+        task = asyncio.create_task(update_notes_safe(uid))  # fonda, javobni kutdirmaydi
+        bg_tasks.add(task)
+        task.add_done_callback(bg_tasks.discard)
 
 
 # ---------- Render uchun ping serveri (port ochish + UptimeRobot uchun) ----------
